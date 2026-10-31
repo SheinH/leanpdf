@@ -652,6 +652,14 @@ static void OpenURL(NSURL *url);
 
 	CGContextRef cg = NSGraphicsContext.currentContext.CGContext;
 	CGContextSetInterpolationQuality(cg, kCGInterpolationHigh);
+	// Soft Preview-style shadow so a white page stays visible on a white background.
+	CGContextSaveGState(cg);
+	CGColorRef shade = CGColorCreateSRGB(0, 0, 0, 0.3);
+	CGContextSetShadowWithColor(cg, CGSizeMake(0, -1), 6, shade);
+	CGColorRelease(shade);
+	CGContextSetFillColorWithColor(cg, NSColor.whiteColor.CGColor);
+	CGContextFillRect(cg, r);
+	CGContextRestoreGState(cg);
 	CGContextDrawImage(cg, r, img);
 	CGImageRelease(img);
 }
