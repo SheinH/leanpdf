@@ -682,6 +682,11 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 - (void)setCurrent:(BOOL)c { if (c != _current) { _current = c; [self restyle]; } }
 - (void)setSelected:(BOOL)s { if (s != _selected) { _selected = s; [self restyle]; } }
 
+// A selected row hands its cells the "emphasized" background style, under which labelColor
+// itself draws white. This cell draws its own highlight and picks its own label colour (see
+// restyle), so it always stays on the normal style.
+- (void)setBackgroundStyle:(NSBackgroundStyle)style { [super setBackgroundStyle:NSBackgroundStyleNormal]; }
+
 - (void)restyle
 {
 	self.textField.textColor = self.current ? NSColor.whiteColor : NSColor.labelColor;
