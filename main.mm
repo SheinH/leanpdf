@@ -15,6 +15,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <Security/Security.h>
 #import <ImageIO/ImageIO.h>
+#import <Accelerate/Accelerate.h>
 #import <CommonCrypto/CommonDigest.h>
 #include <mupdf/fitz.h>
 #include <mupdf/pdf.h>
@@ -160,6 +161,163 @@ static NSImage *ThumbImage(CGImageRef img, CGFloat scale)
 	return [[NSImage alloc] initWithCGImage:img size:NSMakeSize(CGImageGetWidth(img) / scale, CGImageGetHeight(img) / scale)];
 }
 
+// --- fast path for scanned pages --------------------------------------------
+// A scanned book is usually one full-page image per page. MuPDF's renderer spends about half its
+// time on such a page resampling the image, so for these pages we decode the image with MuPDF and
+// scale it with vImage instead, which is several times faster. A grayscale scan also stays
+// grayscale: a third of the memory of RGB. Pages with anything else on them take the normal path.
+
+static bool g_fast_scans = true;
+
+// A device that records a page's drawing and gives up at the first thing that isn't one image.
+struct ScanProbe {
+	fz_device super;
+	fz_image *image;
+	fz_matrix ctm;
+	bool not_scan;
+};
+
+// Throwing stops the interpreter early, but some of its operators (drawing an image, for one)
+// catch and swallow errors, so the flag is what decides.
+static void ProbeGiveUp(fz_context *ctx, fz_device *dev)
+{
+	((ScanProbe *)dev)->not_scan = true;
+	fz_throw(ctx, FZ_ERROR_ABORT, "not a scan");
+}
+
+static void ProbeFillImage(fz_context *ctx, fz_device *dev, fz_image *img, fz_matrix ctm, float alpha, fz_color_params)
+{
+	ScanProbe *p = (ScanProbe *)dev;
+	if (p->image || alpha < 1) ProbeGiveUp(ctx, dev);
+	p->image = fz_keep_image(ctx, img);
+	p->ctm = ctm;
+}
+
+static fz_device *NewScanProbe(fz_context *ctx)
+{
+	ScanProbe *p = fz_new_derived_device(ctx, ScanProbe);
+	fz_device *d = &p->super;
+	d->drop_device = [](fz_context *ctx, fz_device *d) { fz_drop_image(ctx, ((ScanProbe *)d)->image); };
+	d->fill_image = ProbeFillImage;
+	// Everything that draws, clips or composites. Invisible (OCR) text, layers and structure
+	// tags don't change the pixels, so those callbacks stay unset and are ignored.
+	d->fill_path = [](fz_context *c, fz_device *d, const fz_path *, int, fz_matrix, fz_colorspace *, const float *, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->stroke_path = [](fz_context *c, fz_device *d, const fz_path *, const fz_stroke_state *, fz_matrix, fz_colorspace *, const float *, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->clip_path = [](fz_context *c, fz_device *d, const fz_path *, int, fz_matrix, fz_rect) { ProbeGiveUp(c, d); };
+	d->clip_stroke_path = [](fz_context *c, fz_device *d, const fz_path *, const fz_stroke_state *, fz_matrix, fz_rect) { ProbeGiveUp(c, d); };
+	d->fill_text = [](fz_context *c, fz_device *d, const fz_text *, fz_matrix, fz_colorspace *, const float *, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->stroke_text = [](fz_context *c, fz_device *d, const fz_text *, const fz_stroke_state *, fz_matrix, fz_colorspace *, const float *, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->clip_text = [](fz_context *c, fz_device *d, const fz_text *, fz_matrix, fz_rect) { ProbeGiveUp(c, d); };
+	d->clip_stroke_text = [](fz_context *c, fz_device *d, const fz_text *, const fz_stroke_state *, fz_matrix, fz_rect) { ProbeGiveUp(c, d); };
+	d->fill_shade = [](fz_context *c, fz_device *d, fz_shade *, fz_matrix, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->fill_image_mask = [](fz_context *c, fz_device *d, fz_image *, fz_matrix, fz_colorspace *, const float *, float, fz_color_params) { ProbeGiveUp(c, d); };
+	d->clip_image_mask = [](fz_context *c, fz_device *d, fz_image *, fz_matrix, fz_rect) { ProbeGiveUp(c, d); };
+	d->begin_mask = [](fz_context *c, fz_device *d, fz_rect, int, fz_colorspace *, const float *, fz_color_params) { ProbeGiveUp(c, d); };
+	d->begin_group = [](fz_context *c, fz_device *d, fz_rect, fz_colorspace *, int, int, int, float) { ProbeGiveUp(c, d); };
+	d->begin_tile = [](fz_context *c, fz_device *d, fz_rect, fz_rect, float, float, fz_matrix, int, int) -> int { ProbeGiveUp(c, d); return 0; };
+	return d;
+}
+
+static void FreeBuffer(void *, const void *data, size_t) { free((void *)data); }
+
+// If the page is a single upright image covering it, returns that image scaled to the bbox the
+// normal renderer would produce for ctm. Otherwise returns NULL and the caller renders normally.
+static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm)
+{
+	fz_device *dev = NULL;
+	fz_image *image = NULL;
+	fz_pixmap *pix = NULL;
+	CGImageRef img = NULL;
+	fz_var(dev);
+	fz_var(image);
+	fz_var(pix);
+	fz_try(ctx) {
+		dev = NewScanProbe(ctx);
+		fz_run_page(ctx, page, dev, ctm, NULL);
+		fz_close_device(ctx, dev);
+		ScanProbe *p = (ScanProbe *)dev;
+		image = p->image && !p->not_scan ? fz_keep_image(ctx, p->image) : NULL;
+		fz_matrix m = p->ctm;
+		if (!image || image->imagemask || image->mask || image->use_colorkey || image->orientation > 1)
+			break;
+		// Plain DeviceGray/RGB, or gray/RGB with an embedded ICC profile that Core Graphics applies.
+		fz_colorspace *cs = image->colorspace;
+		if (!cs || !(fz_colorspace_is_gray(ctx, cs) || fz_colorspace_is_rgb(ctx, cs)))
+			break;
+		bool device = fz_colorspace_is_device(ctx, cs);
+		if (!device && !(fz_colorspace_is_icc(ctx, cs) && cs->u.icc.buffer))
+			break;
+
+		// Upright (no rotation or flip) and covering the page to within a pixel.
+		fz_rect page_r = fz_transform_rect(fz_bound_page(ctx, page), ctm);
+		fz_irect bbox = fz_round_rect(page_r);
+		fz_rect img_r = fz_transform_rect(fz_unit_rect, m);
+		if (fabsf(m.b) > 1e-3f * m.a || fabsf(m.c) > 1e-3f * m.d || m.a <= 0 || m.d <= 0)
+			break;
+		if (fabsf(img_r.x0 - page_r.x0) > 1 || fabsf(img_r.y0 - page_r.y0) > 1 ||
+		    fabsf(img_r.x1 - page_r.x1) > 1 || fabsf(img_r.y1 - page_r.y1) > 1)
+			break;
+
+		// Decodes at a reduced size when the target is much smaller (thumbnails).
+		pix = fz_get_pixmap_from_image(ctx, image, NULL, &m, NULL, NULL);
+		int n = fz_pixmap_components(ctx, pix);
+		if (fz_pixmap_alpha(ctx, pix) || (n != 1 && n != 3))
+			break;
+
+		vImage_Buffer src = {fz_pixmap_samples(ctx, pix), (vImagePixelCount)fz_pixmap_height(ctx, pix),
+		                     (vImagePixelCount)fz_pixmap_width(ctx, pix), (size_t)fz_pixmap_stride(ctx, pix)};
+		int ow = bbox.x1 - bbox.x0, oh = bbox.y1 - bbox.y0;
+		if (ow <= 0 || oh <= 0)
+			break;
+		vImage_Buffer dst = {malloc((size_t)ow * oh * n), (vImagePixelCount)oh, (vImagePixelCount)ow, (size_t)ow * n};
+		if (!dst.data)
+			fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
+		vImage_Error err;
+		if (n == 1) {
+			err = vImageScale_Planar8(&src, &dst, NULL, kvImageNoFlags);
+		} else {
+			// vImage has no 3-channel scaler: widen to XRGB, scale, then pack back to RGB.
+			vImage_Buffer wide = {malloc(src.width * src.height * 4), src.height, src.width, src.width * 4};
+			vImage_Buffer scaled = {malloc((size_t)ow * oh * 4), (vImagePixelCount)oh, (vImagePixelCount)ow, (size_t)ow * 4};
+			err = wide.data && scaled.data ? kvImageNoError : kvImageMemoryAllocationError;
+			if (err == kvImageNoError) err = vImageConvert_RGB888toARGB8888(&src, NULL, 255, &wide, false, kvImageNoFlags);
+			if (err == kvImageNoError) err = vImageScale_ARGB8888(&wide, &scaled, NULL, kvImageNoFlags);
+			if (err == kvImageNoError) err = vImageConvert_ARGB8888toRGB888(&scaled, &dst, kvImageNoFlags);
+			free(wide.data);
+			free(scaled.data);
+		}
+		if (err != kvImageNoError) {
+			free(dst.data);
+			break;
+		}
+
+		CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, dst.data, dst.rowBytes * oh, FreeBuffer);
+		CGColorSpaceRef cgcs = NULL;
+		if (!device) {
+			unsigned char *icc;
+			size_t len = fz_buffer_storage(ctx, cs->u.icc.buffer, &icc);
+			CFDataRef data = CFDataCreate(NULL, icc, len);
+			cgcs = CGColorSpaceCreateWithICCData(data);
+			CFRelease(data);
+		}
+		if (!cgcs) // DeviceGray/RGB, or a profile Core Graphics can't read: same as MuPDF's defaults
+			cgcs = CGColorSpaceCreateWithName(n == 1 ? kCGColorSpaceExtendedGray : kCGColorSpaceSRGB);
+		img = CGImageCreate(ow, oh, 8, n * 8, dst.rowBytes, cgcs, kCGImageAlphaNone, prov, NULL, true, kCGRenderingIntentDefault);
+		CGColorSpaceRelease(cgcs);
+		CGDataProviderRelease(prov);
+	}
+	fz_always(ctx) {
+		fz_drop_pixmap(ctx, pix);
+		fz_drop_image(ctx, image);
+		fz_drop_device(ctx, dev);
+	}
+	fz_catch(ctx) {
+		// Not a scan, or something went wrong; the normal renderer reports any real error.
+		fz_ignore_error(ctx);
+	}
+	return img;
+}
+
 // Renders page n to fit inside w x h pixels. Caller holds g_doc_lock. Returns +1 or NULL.
 static CGImageRef RenderPage(fz_context *ctx, fz_document *doc, int n, int w, int h)
 {
@@ -172,6 +330,8 @@ static CGImageRef RenderPage(fz_context *ctx, fz_document *doc, int n, int w, in
 		page = fz_load_page(ctx, doc, n);
 		fz_rect b = fz_bound_page(ctx, page);
 		float s = fminf(w / fmaxf(b.x1 - b.x0, 1), h / fmaxf(b.y1 - b.y0, 1));
+		if (g_fast_scans && (img = RenderScan(ctx, page, fz_scale(s, s))))
+			break;
 		pix = fz_new_pixmap_from_page(ctx, page, fz_scale(s, s), fz_device_rgb(ctx), 0);
 		int pw = fz_pixmap_width(ctx, pix), ph = fz_pixmap_height(ctx, pix);
 		size_t stride = fz_pixmap_stride(ctx, pix);
