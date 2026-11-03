@@ -37,7 +37,7 @@ endif
 
 FLAGS   = -std=c++17 $(OPT) -fobjc-arc -Wall -I$(MUPDF_SRC)/include
 LIBS    = $(MUPDF_LIBS) $(JPEG)/lib/libjpeg.a -Wl,-dead_strip \
-          -framework Cocoa -framework PDFKit -framework UniformTypeIdentifiers -framework Security -framework ImageIO -framework Accelerate
+          -framework Cocoa -framework PDFKit -framework UniformTypeIdentifiers -framework Security -framework ImageIO -framework Accelerate -framework QuartzCore -framework IOSurface
 
 all: $(APP)
 
@@ -64,16 +64,16 @@ $(MUPDF_OUT)/.built: $(MUPDF_SRC)/Makefile $(wildcard $(PROFILE))
 		XCFLAGS="$(MUPDF_CFLAGS) $(PGO_USE)" XLDFLAGS="-flto=thin" libs
 	touch $@
 
-# Builds an instrumented mutool, renders TRAIN_PDF the way the app does (fit to window,
-# zoomed in, thumbnails) and merges the recorded profile into $(PROFILE).
+# Builds MuPDF for profiling, renders TRAIN_PDF through the app's own render functions
+# (pgo/train.mm: fit to window, zoomed in, thumbnails) and merges the profile into $(PROFILE).
 pgo-train: $(MUPDF_SRC)/Makefile
 	rm -rf $(MUPDF_GEN) build/pgo-raw && mkdir -p build/pgo-raw pgo
 	$(MAKE) -C $(MUPDF_SRC) $(MUPDF_ARGS) OUT=$(MUPDF_GEN) \
-		XCFLAGS="$(MUPDF_CFLAGS) -fprofile-generate" XLDFLAGS="-flto=thin -fprofile-generate" tools
-	export LLVM_PROFILE_FILE="$(CURDIR)/build/pgo-raw/%p.profraw"; \
-	$(MUPDF_GEN)/mutool draw -q -c rgb -r 1000 -w 1700 -h 2200 "$(TRAIN_PDF)" 1-N && \
-	$(MUPDF_GEN)/mutool draw -q -c rgb -r 1000 -w 3400 -h 4400 "$(TRAIN_PDF)" 1-300 && \
-	$(MUPDF_GEN)/mutool draw -q -c rgb -r 1000 -w 200 -h 260 "$(TRAIN_PDF)" 1-N
+		XCFLAGS="$(MUPDF_CFLAGS) -fprofile-generate -fprofile-update=atomic" \
+		XLDFLAGS="-flto=thin -fprofile-generate" libs
+	$(CXX) $(FLAGS) -w -fprofile-generate pgo/train.mm -o build/pgo-train \
+		$(MUPDF_GEN)/libmupdf.a $(MUPDF_GEN)/libmupdf-third.a $(filter-out $(MUPDF_LIBS),$(LIBS))
+	LLVM_PROFILE_FILE="$(CURDIR)/build/pgo-raw/%p.profraw" build/pgo-train "$(TRAIN_PDF)"
 	xcrun llvm-profdata merge -o $(PROFILE) build/pgo-raw/*.profraw
 
 # The app icon, rendered from icon.svg at every size macOS wants.

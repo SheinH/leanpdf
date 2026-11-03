@@ -16,6 +16,8 @@
 #import <Security/Security.h>
 #import <ImageIO/ImageIO.h>
 #import <Accelerate/Accelerate.h>
+#import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurface.h>
 #import <CommonCrypto/CommonDigest.h>
 #include <mupdf/fitz.h>
 #include <mupdf/pdf.h>
@@ -47,6 +49,12 @@ static const CGFloat kThumbW = 130, kThumbH = 160, kPageMargin = 12, kRingPad = 
 // Thumbnails don't scale, so their sidebar is a fixed width: the item plus 13pt either side, as in Preview.
 static const CGFloat kThumbSideW = kThumbW + 2 * kRingPad + 2 * 13;
 static const CGFloat kLabelGap = 1, kLabelH = 16, kItemBottomPad = 2, kItemGap = 10;
+// Zoom, relative to the page fitted to the window. Zoom In/Out step through kZoomLevels.
+static const CGFloat kZoomLevels[] = {1, 1.25, 1.5, 2, 2.5, 3, 4};
+static const CGFloat kZoomMax = 4;
+// Zoomed in, the sharp render covers what's in view plus this fraction of it past each edge.
+static const CGFloat kDetailMargin = 0.1;
+static bool SameZoom(CGFloat a, CGFloat b) { return fabs(a - b) < 1e-4; }
 
 // The Mistral API key lives in the login keychain as a generic password.
 static NSDictionary *KeyQuery()
@@ -220,9 +228,13 @@ static fz_device *NewScanProbe(fz_context *ctx)
 
 static void FreeBuffer(void *, const void *data, size_t) { free((void *)data); }
 
-// If the page is a single upright image covering it, returns that image scaled to the bbox the
-// normal renderer would produce for ctm. Otherwise returns NULL and the caller renders normally.
-static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm)
+// If the page is a single upright image covering it, returns that image scaled for ctm. Otherwise
+// returns NULL and the caller renders normally. With region NULL the result covers the bbox the
+// normal renderer would produce. Otherwise it covers region, a part of that bbox, scaled with the
+// higher-quality Lanczos5: the crop is snapped to whole source pixels, so it may reach a little past
+// region, and *placed says exactly where it lands in device pixels.
+static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm, const fz_irect *region = NULL,
+                             fz_rect *placed = NULL)
 {
 	fz_device *dev = NULL;
 	fz_image *image = NULL;
@@ -266,22 +278,44 @@ static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm)
 
 		vImage_Buffer src = {fz_pixmap_samples(ctx, pix), (vImagePixelCount)fz_pixmap_height(ctx, pix),
 		                     (vImagePixelCount)fz_pixmap_width(ctx, pix), (size_t)fz_pixmap_stride(ctx, pix)};
-		int ow = bbox.x1 - bbox.x0, oh = bbox.y1 - bbox.y0;
+		fz_rect out = fz_rect_from_irect(bbox);
+		vImage_Flags quality = kvImageNoFlags;
+		if (region) {
+			// Source pixels per device pixel, and the whole source pixels the region needs.
+			float kx = src.width / (img_r.x1 - img_r.x0), ky = src.height / (img_r.y1 - img_r.y0);
+			int sx0 = MAX(0, (int)floorf((region->x0 - img_r.x0) * kx));
+			int sy0 = MAX(0, (int)floorf((region->y0 - img_r.y0) * ky));
+			int sx1 = MIN((int)src.width, (int)ceilf((region->x1 - img_r.x0) * kx));
+			int sy1 = MIN((int)src.height, (int)ceilf((region->y1 - img_r.y0) * ky));
+			if (sx1 <= sx0 || sy1 <= sy0)
+				break;
+			src.data = (uint8_t *)src.data + sy0 * src.rowBytes + sx0 * n;
+			src.width = sx1 - sx0;
+			src.height = sy1 - sy0;
+			out = {img_r.x0 + sx0 / kx, img_r.y0 + sy0 / ky, img_r.x0 + sx1 / kx, img_r.y0 + sy1 / ky};
+			quality = kvImageHighQualityResampling;
+		}
+		int ow = (int)lroundf(out.x1 - out.x0), oh = (int)lroundf(out.y1 - out.y0);
 		if (ow <= 0 || oh <= 0)
 			break;
+		// Land on whole pixels (a shift of under half a pixel) so it's shown without resampling.
+		out.x0 = roundf(out.x0);
+		out.y0 = roundf(out.y0);
+		out.x1 = out.x0 + ow;
+		out.y1 = out.y0 + oh;
 		vImage_Buffer dst = {malloc((size_t)ow * oh * n), (vImagePixelCount)oh, (vImagePixelCount)ow, (size_t)ow * n};
 		if (!dst.data)
 			fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
 		vImage_Error err;
 		if (n == 1) {
-			err = vImageScale_Planar8(&src, &dst, NULL, kvImageNoFlags);
+			err = vImageScale_Planar8(&src, &dst, NULL, quality);
 		} else {
 			// vImage has no 3-channel scaler: widen to XRGB, scale, then pack back to RGB.
 			vImage_Buffer wide = {malloc(src.width * src.height * 4), src.height, src.width, src.width * 4};
 			vImage_Buffer scaled = {malloc((size_t)ow * oh * 4), (vImagePixelCount)oh, (vImagePixelCount)ow, (size_t)ow * 4};
 			err = wide.data && scaled.data ? kvImageNoError : kvImageMemoryAllocationError;
 			if (err == kvImageNoError) err = vImageConvert_RGB888toARGB8888(&src, NULL, 255, &wide, false, kvImageNoFlags);
-			if (err == kvImageNoError) err = vImageScale_ARGB8888(&wide, &scaled, NULL, kvImageNoFlags);
+			if (err == kvImageNoError) err = vImageScale_ARGB8888(&wide, &scaled, NULL, quality);
 			if (err == kvImageNoError) err = vImageConvert_ARGB8888toRGB888(&scaled, &dst, kvImageNoFlags);
 			free(wide.data);
 			free(scaled.data);
@@ -305,6 +339,7 @@ static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm)
 		img = CGImageCreate(ow, oh, 8, n * 8, dst.rowBytes, cgcs, kCGImageAlphaNone, prov, NULL, true, kCGRenderingIntentDefault);
 		CGColorSpaceRelease(cgcs);
 		CGDataProviderRelease(prov);
+		if (placed) *placed = out;
 	}
 	fz_always(ctx) {
 		fz_drop_pixmap(ctx, pix);
@@ -318,33 +353,228 @@ static CGImageRef RenderScan(fz_context *ctx, fz_page *page, fz_matrix ctm)
 	return img;
 }
 
+// img as a GPU surface: opaque BGRA in the display's colour space. Core Animation shows that as it
+// is. A CGImage it would copy, and convert unless it already matched the display, on the main thread
+// when it goes on screen, which drops frames. Returns +1 or NULL.
+static IOSurfaceRef SurfaceFromImage(CGImageRef img, CGColorSpaceRef display)
+{
+	if (!img) return NULL;
+	size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @(w),
+		(id)kIOSurfaceHeight : @(h),
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfaceBytesPerRow : @(IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, w * 4)),
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+	};
+	IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	if (!surf) return NULL;
+	CGColorSpaceRef cs = display ? CGColorSpaceRetain(display) : CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+	IOSurfaceLock(surf, 0, NULL);
+	CGContextRef c = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surf), w, h, 8, IOSurfaceGetBytesPerRow(surf), cs,
+	                                       kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+	if (c) {
+		CGContextSetInterpolationQuality(c, kCGInterpolationNone);
+		CGContextDrawImage(c, CGRectMake(0, 0, w, h), img);
+		CGContextRelease(c);
+	}
+	IOSurfaceUnlock(surf, 0, NULL);
+	CFPropertyListRef pl = CGColorSpaceCopyPropertyList(cs);
+	if (pl) {
+		IOSurfaceSetValue(surf, kIOSurfaceColorSpace, pl);
+		CFRelease(pl);
+	}
+	CGColorSpaceRelease(cs);
+	if (!c) {
+		CFRelease(surf);
+		return NULL;
+	}
+	return surf;
+}
+
+// Draws page into buf, the pixel box r with rows of (r width × components) bytes, which the caller
+// has filled with the background. A big box is split into strips of kStripRows that GCD draws in
+// parallel on up to `cores` threads, each strip with its own clone of ctx (MuPDF needs
+// one context per thread) from a display list recorded once. Small boxes, like thumbnails, are
+// drawn directly: splitting them costs more than it saves.
+static const int kStripRows = 256;
+static const long kParallelMinPixels = 1 << 20;
+
+// How many threads draw strips at once. A page flip uses every core. Zoomed-in renders, which
+// arrive while the user pans, use a quarter of them: drawing on every core then competes with the
+// system compositing the scroll and costs dropped frames (measured: ~1 per 10 s pan at a quarter,
+// ~6 with all cores, ~5 with one).
+static int AllCores() { return MAX(1, (int)NSProcessInfo.processInfo.activeProcessorCount); }
+static int PanCores() { return MAX(1, AllCores() / 4); }
+
+static void DrawPage(fz_context *ctx, fz_page *page, fz_matrix ctm, fz_irect r, fz_colorspace *cs, int alpha,
+                     unsigned char *buf, int cores)
+{
+	int w = r.x1 - r.x0, h = r.y1 - r.y0;
+	size_t stride = (size_t)w * (fz_colorspace_n(ctx, cs) + alpha);
+	fz_pixmap *pix = NULL;
+	fz_device *dev = NULL;
+	fz_display_list *list = NULL;
+	fz_var(pix);
+	fz_var(dev);
+	fz_var(list);
+	if ((long)w * h < kParallelMinPixels) {
+		fz_try(ctx) {
+			pix = fz_new_pixmap_with_bbox_and_data(ctx, cs, r, NULL, alpha, buf);
+			dev = fz_new_draw_device(ctx, fz_identity, pix);
+			fz_run_page(ctx, page, dev, ctm, NULL);
+			fz_close_device(ctx, dev);
+		}
+		fz_always(ctx) {
+			fz_drop_device(ctx, dev);
+			fz_drop_pixmap(ctx, pix);
+		}
+		fz_catch(ctx) fz_rethrow(ctx);
+		return;
+	}
+
+	list = fz_new_display_list_from_page(ctx, page);
+	int strips = (h + kStripRows - 1) / kStripRows;
+	int lanes = MIN(strips, cores);
+	std::vector<fz_context *> ctxs(lanes);
+	for (auto &c : ctxs) c = fz_clone_context(ctx);
+	fz_context **cp = ctxs.data();
+	__block bool failed = false;
+	std::atomic<int> nextStrip{0};
+	std::atomic<int> *next = &nextStrip;
+	dispatch_apply(lanes, dispatch_get_global_queue(qos_class_self(), 0), ^(size_t lane) {
+		fz_context *c = cp[lane];
+		if (!c) {
+			failed = true;
+			return;
+		}
+		for (int i; (i = next->fetch_add(1)) < strips;) {
+			int y0 = r.y0 + i * kStripRows, y1 = MIN(r.y1, y0 + kStripRows);
+			fz_irect sr = fz_make_irect(r.x0, y0, r.x1, y1);
+			fz_pixmap *spix = NULL;
+			fz_device *sdev = NULL;
+			fz_var(spix);
+			fz_var(sdev);
+			fz_try(c) {
+				spix = fz_new_pixmap_with_bbox_and_data(c, cs, sr, NULL, alpha, buf + (size_t)(y0 - r.y0) * stride);
+				sdev = fz_new_draw_device(c, fz_identity, spix);
+				fz_run_display_list(c, list, sdev, ctm, fz_rect_from_irect(sr), NULL);
+				fz_close_device(c, sdev);
+			}
+			fz_always(c) {
+				fz_drop_device(c, sdev);
+				fz_drop_pixmap(c, spix);
+			}
+			fz_catch(c) {
+				fz_report_error(c);
+				failed = true;
+			}
+		}
+	});
+	for (fz_context *c : ctxs) fz_drop_context(c);
+	fz_drop_display_list(ctx, list);
+	if (failed) fz_throw(ctx, FZ_ERROR_GENERIC, "page could not be drawn");
+}
+
 // Renders page n to fit inside w x h pixels. Caller holds g_doc_lock. Returns +1 or NULL.
 static CGImageRef RenderPage(fz_context *ctx, fz_document *doc, int n, int w, int h)
 {
 	fz_page *page = NULL;
-	fz_pixmap *pix = NULL;
+	unsigned char *buf = NULL;
 	CGImageRef img = NULL;
 	fz_var(page);
-	fz_var(pix);
+	fz_var(buf);
 	fz_try(ctx) {
 		page = fz_load_page(ctx, doc, n);
 		fz_rect b = fz_bound_page(ctx, page);
 		float s = fminf(w / fmaxf(b.x1 - b.x0, 1), h / fmaxf(b.y1 - b.y0, 1));
 		if (g_fast_scans && (img = RenderScan(ctx, page, fz_scale(s, s))))
 			break;
-		pix = fz_new_pixmap_from_page(ctx, page, fz_scale(s, s), fz_device_rgb(ctx), 0);
-		int pw = fz_pixmap_width(ctx, pix), ph = fz_pixmap_height(ctx, pix);
-		size_t stride = fz_pixmap_stride(ctx, pix);
-		CFDataRef data = CFDataCreate(NULL, fz_pixmap_samples(ctx, pix), stride * ph);
-		CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+		// RGB on white, like fz_new_pixmap_from_page, drawn on all cores.
+		fz_irect r = fz_round_rect(fz_transform_rect(b, fz_scale(s, s)));
+		int pw = r.x1 - r.x0, ph = r.y1 - r.y0;
+		size_t stride = (size_t)pw * 3;
+		if (pw <= 0 || ph <= 0) break;
+		buf = (unsigned char *)malloc(stride * ph);
+		if (!buf) fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
+		memset(buf, 255, stride * ph);
+		DrawPage(ctx, page, fz_scale(s, s), r, fz_device_rgb(ctx), 0, buf, AllCores());
+		CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, buf, stride * ph, FreeBuffer);
+		buf = NULL; // the image owns it now
 		CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
 		img = CGImageCreate(pw, ph, 8, 24, stride, cs, kCGImageAlphaNone, prov, NULL, true, kCGRenderingIntentDefault);
 		CGColorSpaceRelease(cs);
 		CGDataProviderRelease(prov);
-		CFRelease(data);
 	}
 	fz_always(ctx) {
-		fz_drop_pixmap(ctx, pix);
+		free(buf);
+		fz_drop_page(ctx, page);
+	}
+	fz_catch(ctx) {
+		fz_report_error(ctx);
+	}
+	return img;
+}
+
+// Renders part of page n at zoom times the size RenderPage(w, h) gives it. Lengths are in points
+// of that 100% page, of which there are scale pixels each. With top, the part is a vis-sized view
+// scrolled to the top of the page and centred across it (where a page opens when zoomed), plus
+// kDetailMargin; otherwise it is *region. On return *region is the part rendered, *placed where the
+// image lands (it may reach a little past *region) and *size the 100% page's size. Caller holds
+// g_doc_lock. Returns +1 or NULL.
+static CGImageRef RenderDetail(fz_context *ctx, fz_document *doc, int n, int w, int h, CGFloat zoom, CGFloat scale,
+                               bool top, NSSize vis, NSRect *region, NSRect *placed, NSSize *size)
+{
+	fz_page *page = NULL;
+	CGImageRef img = NULL;
+	fz_var(page);
+	fz_try(ctx) {
+		page = fz_load_page(ctx, doc, n);
+		fz_rect b = fz_bound_page(ctx, page);
+		float s0 = fminf(w / fmaxf(b.x1 - b.x0, 1), h / fmaxf(b.y1 - b.y0, 1));
+		fz_irect fit = fz_round_rect(fz_transform_rect(b, fz_scale(s0, s0)));
+		*size = NSMakeSize((fit.x1 - fit.x0) / scale, (fit.y1 - fit.y0) / scale);
+		NSRect whole = {NSZeroPoint, *size};
+		if (top) {
+			NSRect v = NSMakeRect((size->width - vis.width) / 2, -kPageMargin, vis.width, vis.height);
+			*region = NSInsetRect(v, -vis.width * kDetailMargin, -vis.height * kDetailMargin);
+		}
+		*region = NSIntersectionRect(*region, whole);
+		if (NSIsEmptyRect(*region))
+			break;
+
+		float s = s0 * zoom;   // device pixels per PDF point
+		CGFloat k = zoom * scale; // device pixels per page point
+		fz_matrix ctm = fz_scale(s, s);
+		fz_irect full = fz_round_rect(fz_transform_rect(b, ctm));
+		fz_irect r = fz_intersect_irect(fz_make_irect(full.x0 + (int)floor(NSMinX(*region) * k), full.y0 + (int)floor(NSMinY(*region) * k),
+		                                              full.x0 + (int)ceil(NSMaxX(*region) * k), full.y0 + (int)ceil(NSMaxY(*region) * k)),
+		                                full);
+		if (fz_is_empty_irect(r))
+			break;
+		fz_rect out = fz_rect_from_irect(r);
+		if (!(g_fast_scans && (img = RenderScan(ctx, page, ctm, &r, &out)))) {
+			// Straight into opaque BGRA, the layout Core Animation uses, so it's shown without conversion.
+			int pw = r.x1 - r.x0, ph = r.y1 - r.y0;
+			size_t stride = (size_t)pw * 4;
+			unsigned char *buf = (unsigned char *)malloc(stride * ph);
+			if (!buf) fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
+			memset(buf, 255, stride * ph);
+			fz_try(ctx) DrawPage(ctx, page, ctm, r, fz_device_bgr(ctx), 1, buf, PanCores());
+			fz_catch(ctx) {
+				free(buf);
+				fz_rethrow(ctx);
+			}
+			CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, buf, stride * ph, FreeBuffer);
+			CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+			img = CGImageCreate(pw, ph, 8, 32, stride, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+			                    prov, NULL, true, kCGRenderingIntentDefault);
+			CGColorSpaceRelease(cs);
+			CGDataProviderRelease(prov);
+		}
+		*placed = NSMakeRect((out.x0 - full.x0) / k, (out.y0 - full.y0) / k, (out.x1 - out.x0) / k, (out.y1 - out.y0) / k);
+	}
+	fz_always(ctx) {
 		fz_drop_page(ctx, page);
 	}
 	fz_catch(ctx) {
@@ -392,12 +622,18 @@ static NSArray<TocItem *> *BuildToc(fz_context *ctx, fz_document *doc, fz_outlin
 
 @class Viewer;
 
-enum JobKind { kJobThumb, kJobPrefetch };
+enum JobKind { kJobThumb, kJobPrefetch, kJobDetail };
 
 @interface Job : NSObject {
 @public
 	__weak Viewer *viewer;
 	int page, kind, w, h;
+	bool force;          // thumbnail: render even if scrolled out of the sidebar
+	bool top;            // detail: for a neighbouring page, kept only if it has none at this zoom
+	CGFloat zoom, scale; // detail
+	NSRect region;       // detail: page points
+	unsigned gen;        // detail: skipped once stale
+	id space;            // detail: the display's CGColorSpace, which the result is converted to
 }
 @end
 @implementation Job
@@ -406,7 +642,7 @@ enum JobKind { kJobThumb, kJobPrefetch };
 static NSMutableArray<Job *> *g_jobs;
 static dispatch_semaphore_t g_jobSem;
 
-static void Enqueue(Viewer *v, int page, int kind, int w, int h)
+static Job *NewJob(Viewer *v, int page, int kind, int w, int h)
 {
 	Job *j = [Job new];
 	j->viewer = v;
@@ -414,9 +650,16 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 	j->kind = kind;
 	j->w = w;
 	j->h = h;
+	return j;
+}
+
+static void Push(Job *j)
+{
 	@synchronized(g_jobs) { [g_jobs addObject:j]; }
 	dispatch_semaphore_signal(g_jobSem);
 }
+
+static void Enqueue(Viewer *v, int page, int kind, int w, int h) { Push(NewJob(v, page, kind, w, h)); }
 
 // ---------------------------------------------------------------------------
 // OCR status: a panel at the bottom of the sidebar with a title, a progress bar that turns red on
@@ -579,9 +822,17 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 // ---------------------------------------------------------------------------
 
 @interface PageView : NSView
-@property (weak) Viewer *viewer;
+@property (nonatomic, weak) Viewer *viewer;
+@property (nonatomic) CGFloat zoom; // 1 = fit to window
 - (void)dropCache;
+- (void)reload; // the page changed, or needs rendering again
+- (void)detailReady:(int)n;
+- (void)thumbReady:(int)n;
+- (void)mapMovedTo:(NSPoint)unit;
 @end
+
+// A sharp render of part of a page at some zoom (see RenderDetail).
+struct PageDetail { int w, h; CGFloat zoom; NSRect region, placed; NSSize size; id surf; int pw, ph; }; // surf: IOSurface
 
 @interface Viewer : NSObject <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate,
                               NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuItemValidation,
@@ -595,7 +846,12 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 	struct Cached { int w, h; CGImageRef img; };
 	std::map<int, Cached> pageCache; // guarded by g_doc_lock
 	std::atomic<bool> dormant;       // idle in the background: no caches, no prefetch
+	// Sharp renders of part of a page when zoomed in, for the current page and its neighbours.
+	std::map<int, PageDetail> detailCache; // guarded by g_doc_lock
+	std::atomic<unsigned> detailGen;   // bumped when zoom or window size change
+	std::atomic<unsigned> detailReq;   // the latest request for the current page
 }
+@property (strong) NSToolbarItemGroup *zoomItem;
 @property (strong) NSTimer *idleTimer;
 @property (strong) NSWindow *window;
 @property (strong) NSString *path;
@@ -622,6 +878,14 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 - (void)clearSelection;
 - (void)thumbClicked:(int)row modifiers:(NSEventModifierFlags)m;
 - (CGImageRef)copyImageForPage:(int)n width:(int)w height:(int)h;
+- (CGImageRef)copyThumbForPage:(int)n request:(BOOL)request;
+- (void)requestDetail:(int)n width:(int)w height:(int)h zoom:(CGFloat)z scale:(CGFloat)s region:(NSRect)r;
+- (void)prefetchDetail:(int)n width:(int)w height:(int)h zoom:(CGFloat)z scale:(CGFloat)s region:(NSRect)r;
+- (void)dropDetails;
+- (void)zoomChanged;
+- (IBAction)zoomIn:(id)s;
+- (IBAction)zoomOut:(id)s;
+- (IBAction)resetZoom:(id)s;
 @end
 
 @interface ThumbTable : NSTableView
@@ -673,6 +937,7 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 // Preview-style highlight: a rounded box behind the page and its label. The viewed page's box is
 // the accent colour with a white label; other selected pages get a gray box.
 @interface ThumbCell : NSTableCellView
+- (void)restyle;
 @property (strong) ThumbView *thumb;
 @property (nonatomic) BOOL current, selected;
 @end
@@ -687,10 +952,24 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 // restyle), so it always stays on the normal style.
 - (void)setBackgroundStyle:(NSBackgroundStyle)style { [super setBackgroundStyle:NSBackgroundStyleNormal]; }
 
+// The label gets a fixed colour, resolved here for the light or dark appearance. A dynamic colour
+// like labelColor is resolved again at draw time against the selection style of the row around
+// it, which can still turn it white.
 - (void)restyle
 {
-	self.textField.textColor = self.current ? NSColor.whiteColor : NSColor.labelColor;
+	NSColor *c = self.current ? NSColor.whiteColor : NSColor.labelColor;
+	__block NSColor *fixed = c;
+	[self.effectiveAppearance performAsCurrentDrawingAppearance:^{
+		fixed = [c colorUsingColorSpace:NSColorSpace.sRGBColorSpace] ?: c;
+	}];
+	self.textField.textColor = fixed;
 	self.needsDisplay = YES;
+}
+
+- (void)viewDidChangeEffectiveAppearance
+{
+	[super viewDidChangeEffectiveAppearance];
+	[self restyle];
 }
 
 - (void)drawRect:(NSRect)dirty
@@ -732,6 +1011,7 @@ static void Enqueue(Viewer *v, int page, int kind, int w, int h)
 // Page keys, identical in the page view and the thumbnail list:
 // arrows / Page Up/Down / Home / End move the viewed page,
 // Shift+Up/Down move it while extending the selection, Space selects the viewed page, Delete clears the selection.
+// + / = zoom in, - zooms out, 0 resets the zoom.
 // Returns NO for keys it doesn't handle.
 static BOOL HandlePageKey(Viewer *v, NSEvent *e)
 {
@@ -748,6 +1028,9 @@ static BOOL HandlePageKey(Viewer *v, NSEvent *e)
 	case NSEndFunctionKey: [v goToPage:v->count - 1]; return YES;
 	case ' ': [v selectCurrent]; return YES;
 	case NSDeleteCharacter: [v clearSelection]; return YES;
+	case '+': case '=': [v zoomIn:nil]; return YES;
+	case '-': [v zoomOut:nil]; return YES;
+	case '0': [v resetZoom:nil]; return YES;
 	}
 	return NO;
 }
@@ -759,90 +1042,49 @@ static void OpenURL(NSURL *url);
 
 // ---------------------------------------------------------------------------
 
-@implementation PageView {
-	CGImageRef _last; // last image drawn, reused (scaled) during live resize
-	int _lastPage;
+// --- zoomable page -----------------------------------------------------------
+// PageView holds a scroll view whose document is the page plus a margin. At 100% the page is the
+// fitted render from copyImageForPage:, shown 1:1 as a layer's contents. Zooming is the scroll
+// view's magnification, so the GPU scales the layers. Once a zoom settles, a sharp render of what's
+// in view (the "detail") is laid over the page.
+
+// Keeps the page centred while it's smaller than the clip view, on whole pixels.
+@interface CenteringClipView : NSClipView
+@end
+@implementation CenteringClipView
+- (NSRect)constrainBoundsRect:(NSRect)r
+{
+	r = [super constrainBoundsRect:r];
+	NSView *d = self.documentView;
+	if (!d) return r;
+	NSSize ds = d.frame.size;
+	CGFloat s = self.window.backingScaleFactor ?: 2;
+	// Centre in the part not under the toolbar or sidebar. Insets are in view points; bounds are
+	// in document units, which differ by the zoom.
+	NSEdgeInsets in = self.contentInsets;
+	CGFloat m = r.size.width > 0 ? self.frame.size.width / r.size.width : 1;
+	CGFloat vw = r.size.width - (in.left + in.right) / m, vh = r.size.height - (in.top + in.bottom) / m;
+	if (vw > ds.width) r.origin.x = round(((ds.width - vw) / 2 - in.left / m) * s) / s;
+	if (vh > ds.height) r.origin.y = round(((ds.height - vh) / 2 - in.top / m) * s) / s;
+	return r;
+}
+@end
+
+// At 100%, trackpad / wheel flips pages; zoomed in, it pans. No double-tap smart zoom.
+@interface PageScrollView : NSScrollView
+@property (weak) Viewer *viewer;
+@end
+@implementation PageScrollView {
 	CGFloat _scrollAcc;
 }
-
-- (BOOL)acceptsFirstResponder { return YES; }
-- (BOOL)isOpaque { return YES; }
-
-- (instancetype)initWithFrame:(NSRect)f
-{
-	if ((self = [super initWithFrame:f]))
-		[self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
-	return self;
-}
-
-- (void)dealloc { CGImageRelease(_last); }
-
-- (void)dropCache
-{
-	CGImageRelease(_last);
-	_last = NULL;
-}
-
-- (void)drawRect:(NSRect)dirty
-{
-	[[NSColor textBackgroundColor] setFill];
-	NSRectFill(dirty);
-	Viewer *v = self.viewer;
-	if (!v) return;
-	int n = v->current;
-	// The view runs under the title bar; lay the page out in the part below it.
-	NSRect avail = NSInsetRect(self.safeAreaRect, kPageMargin, kPageMargin);
-	NSRect px = [self convertRectToBacking:avail];
-	int w = (int)floor(px.size.width), h = (int)floor(px.size.height);
-	if (w <= 0 || h <= 0) return;
-
-	CGImageRef img = NULL;
-	if (self.inLiveResize && _last && _lastPage == n)
-		img = CGImageRetain(_last);
-	else
-		img = [v copyImageForPage:n width:w height:h];
-	if (!img) return;
-	if (img != _last) {
-		CGImageRelease(_last);
-		_last = CGImageRetain(img);
-		_lastPage = n;
-	}
-
-	// Fit the image into the available pixels, centred and pixel-aligned.
-	CGFloat iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
-	CGFloat s = fmin(1.0, fmin(w / iw, h / ih));
-	if (self.inLiveResize) s = fmin(w / iw, h / ih);
-	NSRect r = NSMakeRect(round(NSMidX(px) - iw * s / 2), round(NSMidY(px) - ih * s / 2), round(iw * s), round(ih * s));
-	r = [self convertRectFromBacking:r];
-
-	CGContextRef cg = NSGraphicsContext.currentContext.CGContext;
-	CGContextSetInterpolationQuality(cg, kCGInterpolationHigh);
-	// Soft Preview-style shadow so a white page stays visible on a white background.
-	CGContextSaveGState(cg);
-	CGColorRef shade = CGColorCreateSRGB(0, 0, 0, 0.3);
-	CGContextSetShadowWithColor(cg, CGSizeMake(0, -1), 6, shade);
-	CGColorRelease(shade);
-	CGContextSetFillColorWithColor(cg, NSColor.whiteColor.CGColor);
-	CGContextFillRect(cg, r);
-	CGContextRestoreGState(cg);
-	CGContextDrawImage(cg, r, img);
-	CGImageRelease(img);
-}
-
-- (void)viewDidEndLiveResize
-{
-	[super viewDidEndLiveResize];
-	self.needsDisplay = YES;
-}
-
-- (void)keyDown:(NSEvent *)e
-{
-	if (!HandlePageKey(self.viewer, e)) [super keyDown:e];
-}
-
-// Trackpad / wheel flips pages. Momentum is ignored so one swipe ≈ one flip.
+- (void)smartMagnifyWithEvent:(NSEvent *)e {}
 - (void)scrollWheel:(NSEvent *)e
 {
+	if (self.magnification > 1.001) {
+		[super scrollWheel:e];
+		return;
+	}
+	// Momentum is ignored so one swipe ≈ one flip.
 	if (e.momentumPhase != NSEventPhaseNone) return;
 	if (e.phase == NSEventPhaseBegan) _scrollAcc = 0;
 	CGFloat d = fabs(e.scrollingDeltaY) >= fabs(e.scrollingDeltaX) ? e.scrollingDeltaY : e.scrollingDeltaX;
@@ -853,6 +1095,837 @@ static void OpenURL(NSURL *url);
 		_scrollAcc = 0;
 	}
 }
+@end
+
+// The scroll view's document: the page plus kPageMargin all round. Clicks focus the page view.
+@interface DocView : NSView
+@end
+@implementation DocView
+- (BOOL)isFlipped { return YES; }
+- (void)mouseDown:(NSEvent *)e { [self.window makeFirstResponder:self.enclosingScrollView.superview]; }
+@end
+
+// A view that shows a CGImage as its layer's contents, stretched to its bounds.
+@interface ImageLayerView : NSView
+@property (nonatomic) CGImageRef image;
+@property (nonatomic, strong) id contents; // anything else a layer can show (an IOSurface); wins over image
+@end
+@implementation ImageLayerView {
+	CGImageRef _image;
+}
+- (instancetype)initWithFrame:(NSRect)f
+{
+	if ((self = [super initWithFrame:f])) {
+		self.wantsLayer = YES;
+		self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+	}
+	return self;
+}
+- (void)dealloc { CGImageRelease(_image); }
+- (BOOL)isFlipped { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (NSView *)hitTest:(NSPoint)p { return nil; }
+- (CGImageRef)image { return _image; }
+- (void)setImage:(CGImageRef)img
+{
+	if (img == _image) return;
+	CGImageRetain(img);
+	CGImageRelease(_image);
+	_image = img;
+	self.needsDisplay = YES;
+}
+- (void)setContents:(id)c
+{
+	if (c == _contents) return;
+	_contents = c;
+	self.needsDisplay = YES;
+}
+- (void)updateLayer
+{
+	CALayer *l = self.layer;
+	l.contents = _contents ?: (__bridge id)_image;
+	l.magnificationFilter = kCAFilterLinear;
+	l.minificationFilter = kCAFilterTrilinear;
+}
+@end
+
+// The page itself: white, with the soft Preview-style shadow so it stays visible on white.
+@interface PageSurface : ImageLayerView
+@end
+@implementation PageSurface
+- (void)setFrameSize:(NSSize)s
+{
+	[super setFrameSize:s];
+	self.needsDisplay = YES;
+}
+- (void)updateLayer
+{
+	[super updateLayer];
+	CALayer *l = self.layer;
+	l.backgroundColor = NSColor.whiteColor.CGColor;
+	l.shadowColor = NSColor.blackColor.CGColor;
+	l.shadowOpacity = 0.3;
+	l.shadowRadius = 3;
+	l.shadowOffset = CGSizeMake(0, -1);
+	CGPathRef p = CGPathCreateWithRect(l.bounds, NULL);
+	l.shadowPath = p;
+	CGPathRelease(p);
+}
+@end
+
+// --- mini-map ----------------------------------------------------------------
+// Shown while zoomed in, at the bottom right: the page's thumbnail as a small floating card, the
+// part outside the view dimmed, and a pane of clear glass over the part in view. Drag the pane to
+// pan, or click elsewhere on the card to jump there.
+
+static const CGFloat kMapW = 120, kMapMaxH = 160, kMapInset = 16, kMapRadius = 8;
+
+@interface MiniMap : NSView
+@property (weak) PageView *pageView;
+@property (weak) NSScrollView *target; // scrolls and pinches over the map go here
+- (void)setImage:(CGImageRef)img;
+- (void)setViewport:(NSRect)unit; // the part in view, in fractions of the page (y down)
++ (NSSize)sizeForPage:(NSSize)page;
+@end
+
+@interface FlippedView : NSView
+@end
+@implementation FlippedView
+- (BOOL)isFlipped { return YES; }
+@end
+
+// Dims the map outside the viewport: four plain strips around the hole, moved by the GPU, never
+// redrawn. The hole is square; the lens fills in its rounded corners.
+static const CGFloat kMapDimAlpha = 0.22;
+@interface MapDim : NSView
+@property (nonatomic) NSRect hole;
+@end
+@implementation MapDim {
+	NSView *_strips[4];
+}
+- (instancetype)initWithFrame:(NSRect)f
+{
+	if ((self = [super initWithFrame:f])) {
+		self.wantsLayer = YES;
+		for (int i = 0; i < 4; i++) {
+			NSView *v = _strips[i] = [NSView new];
+			v.wantsLayer = YES;
+			v.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+			v.alphaValue = kMapDimAlpha;
+			[self addSubview:v];
+		}
+	}
+	return self;
+}
+- (BOOL)isFlipped { return YES; }
+- (NSView *)hitTest:(NSPoint)p { return nil; }
+- (void)setHole:(NSRect)h
+{
+	_hole = h;
+	[self place];
+}
+- (void)layout
+{
+	[super layout];
+	[self place];
+}
+- (void)place
+{
+	NSRect b = self.bounds, h = NSIntersectionRect(_hole, b);
+	if (NSIsEmptyRect(h)) h = NSMakeRect(NSMidX(b), NSMidY(b), 0, 0);
+	_strips[0].frame = NSMakeRect(0, 0, b.size.width, NSMinY(h));                                    // above
+	_strips[1].frame = NSMakeRect(0, NSMaxY(h), b.size.width, b.size.height - NSMaxY(h));            // below
+	_strips[2].frame = NSMakeRect(0, NSMinY(h), NSMinX(h), h.size.height);                           // left
+	_strips[3].frame = NSMakeRect(NSMaxX(h), NSMinY(h), b.size.width - NSMaxX(h), h.size.height);    // right
+}
+@end
+
+// A pane of clear glass: no blur or tint, only a bright rim, a faint sheen along its top edge and a
+// soft shadow that lifts it off the page. Drawn once into a small image that the GPU stretches to
+// any size (only the clear middle stretches), so moving or resizing it costs no drawing.
+// The image reaches kLensPad past the pane to leave room for the shadow.
+static const CGFloat kLensPad = 4, kLensRadius = 5, kLensCap = kLensPad + 7;
+@interface MapLens : NSView
+@end
+@implementation MapLens {
+	CGImageRef _art;
+	CGFloat _artScale;
+}
+- (instancetype)initWithFrame:(NSRect)f
+{
+	if ((self = [super initWithFrame:f])) {
+		self.wantsLayer = YES;
+		self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+	}
+	return self;
+}
+- (void)dealloc { CGImageRelease(_art); }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (NSView *)hitTest:(NSPoint)p { return nil; }
+- (void)viewDidChangeBackingProperties
+{
+	[super viewDidChangeBackingProperties];
+	self.needsDisplay = YES;
+}
+
+// The pane at its smallest: the caps plus one stretchable point.
++ (CGImageRef)newArtAtScale:(CGFloat)scale
+{
+	CGFloat side = 2 * kLensCap + 1;
+	size_t px = (size_t)ceil(side * scale);
+	CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+	CGContextRef c = CGBitmapContextCreate(NULL, px, px, 8, px * 4, cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(cs);
+	CGContextScaleCTM(c, scale, scale);
+	NSGraphicsContext *old = NSGraphicsContext.currentContext;
+	NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:c flipped:NO];
+
+	NSRect bounds = NSMakeRect(0, 0, side, side);
+	NSRect r = NSInsetRect(bounds, kLensPad, kLensPad);
+	NSBezierPath *pane = [NSBezierPath bezierPathWithRoundedRect:r xRadius:kLensRadius yRadius:kLensRadius];
+
+	// The dimming in the hole's corners, outside the pane's rounded ones.
+	[NSGraphicsContext saveGraphicsState];
+	NSBezierPath *corners = [NSBezierPath bezierPathWithRect:r];
+	[corners appendBezierPath:pane];
+	corners.windingRule = NSWindingRuleEvenOdd;
+	[[NSColor colorWithWhite:0 alpha:kMapDimAlpha] setFill];
+	[corners fill];
+	[NSGraphicsContext restoreGraphicsState];
+
+	// Shadow, only outside the pane so the glass stays clear.
+	[NSGraphicsContext saveGraphicsState];
+	NSBezierPath *outside = [NSBezierPath bezierPathWithRect:bounds];
+	[outside appendBezierPath:pane];
+	outside.windingRule = NSWindingRuleEvenOdd;
+	[outside addClip];
+	NSShadow *sh = [NSShadow new];
+	sh.shadowColor = [NSColor colorWithWhite:0 alpha:0.35];
+	sh.shadowBlurRadius = 3;
+	sh.shadowOffset = NSMakeSize(0, -1);
+	[sh set];
+	[NSColor.blackColor setFill];
+	[pane fill];
+	[NSGraphicsContext restoreGraphicsState];
+
+	// Sheen: light catching the top edge of the glass (y is up here).
+	[NSGraphicsContext saveGraphicsState];
+	[pane addClip];
+	NSGradient *g = [[NSGradient alloc] initWithColors:@[ [NSColor colorWithWhite:1 alpha:0.32], [NSColor colorWithWhite:1 alpha:0] ]];
+	[g drawFromPoint:NSMakePoint(0, NSMaxY(r)) toPoint:NSMakePoint(0, NSMaxY(r) - (kLensCap - kLensPad)) options:0];
+	[NSGraphicsContext restoreGraphicsState];
+
+	// Rim: a thin dark edge for contrast on white pages, and a bright edge just inside it.
+	pane.lineWidth = 1;
+	[[NSColor colorWithWhite:0 alpha:0.30] setStroke];
+	[pane stroke];
+	NSBezierPath *inner = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(r, 1, 1) xRadius:kLensRadius - 1 yRadius:kLensRadius - 1];
+	inner.lineWidth = 1;
+	[[NSColor colorWithWhite:1 alpha:0.85] setStroke];
+	[inner stroke];
+
+	NSGraphicsContext.currentContext = old;
+	CGImageRef img = CGBitmapContextCreateImage(c);
+	CGContextRelease(c);
+	return img;
+}
+
+- (void)updateLayer
+{
+	CGFloat scale = self.window.backingScaleFactor ?: 2;
+	if (!_art || _artScale != scale) {
+		CGImageRelease(_art);
+		_art = [MapLens newArtAtScale:scale];
+		_artScale = scale;
+	}
+	CALayer *l = self.layer;
+	l.contents = (__bridge id)_art;
+	l.contentsScale = scale;
+	CGFloat side = 2 * kLensCap + 1;
+	l.contentsCenter = CGRectMake(kLensCap / side, kLensCap / side, 1 / side, 1 / side);
+}
+@end
+
+@implementation MiniMap {
+	NSView *_card;          // rounded, clips the thumbnail and dimming
+	ImageLayerView *_img;
+	MapDim *_dim;
+	MapLens *_lens;
+	NSRect _unit, _vp;      // viewport in fractions, and in points
+	NSPoint _grab;          // where in the pane the drag holds it, from its centre
+}
+
++ (NSSize)sizeForPage:(NSSize)p
+{
+	if (p.width <= 0 || p.height <= 0) return NSZeroSize;
+	CGFloat w = kMapW, h = w * p.height / p.width;
+	if (h > kMapMaxH) {
+		h = kMapMaxH;
+		w = h * p.width / p.height;
+	}
+	return NSMakeSize(round(w), round(h));
+}
+
+- (instancetype)initWithFrame:(NSRect)f
+{
+	if (!(self = [super initWithFrame:f])) return nil;
+	self.wantsLayer = YES;
+	self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+
+	_card = [[FlippedView alloc] initWithFrame:self.bounds];
+	_card.wantsLayer = YES;
+	_card.layer.cornerRadius = kMapRadius;
+	if (@available(macOS 10.15, *)) _card.layer.cornerCurve = kCACornerCurveContinuous;
+	_card.layer.masksToBounds = YES;
+	_card.layer.borderWidth = 0.5;
+	_card.layer.backgroundColor = NSColor.whiteColor.CGColor;
+	_img = [ImageLayerView new];
+	_dim = [MapDim new];
+	[_card addSubview:_img];
+	[_card addSubview:_dim];
+	[self addSubview:_card];
+	_lens = [MapLens new];
+	[self addSubview:_lens];
+	[self updateColors];
+	return self;
+}
+
+- (BOOL)isFlipped { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)e { return YES; }
+
+- (void)updateLayer
+{
+	// Floating card shadow.
+	CALayer *l = self.layer;
+	l.shadowColor = NSColor.blackColor.CGColor;
+	l.shadowOpacity = 0.22;
+	l.shadowRadius = 10;
+	l.shadowOffset = CGSizeMake(0, -3);
+	CGPathRef p = CGPathCreateWithRoundedRect(l.bounds, kMapRadius, kMapRadius, NULL);
+	l.shadowPath = p;
+	CGPathRelease(p);
+}
+
+- (void)viewDidChangeEffectiveAppearance
+{
+	[super viewDidChangeEffectiveAppearance];
+	[self updateColors];
+}
+
+- (void)updateColors
+{
+	[self.effectiveAppearance performAsCurrentDrawingAppearance:^{
+		self->_card.layer.borderColor = [NSColor.labelColor colorWithAlphaComponent:0.18].CGColor;
+	}];
+}
+
+- (void)setImage:(CGImageRef)img { _img.image = img; }
+
+- (void)setViewport:(NSRect)unit
+{
+	if (NSEqualRects(unit, _unit)) return;
+	_unit = unit;
+	[self place];
+}
+
+- (void)layout
+{
+	[super layout];
+	_card.frame = self.bounds;
+	_img.frame = _card.bounds;
+	_dim.frame = _card.bounds;
+	self.needsDisplay = YES;
+	[self place];
+}
+
+- (void)place
+{
+	NSSize s = self.bounds.size;
+	NSRect vp = NSMakeRect(_unit.origin.x * s.width, _unit.origin.y * s.height, _unit.size.width * s.width,
+	                       _unit.size.height * s.height);
+	// Never smaller than something you can grab.
+	CGFloat minSide = 10;
+	if (vp.size.width < minSide) vp = NSInsetRect(vp, (vp.size.width - minSide) / 2, 0);
+	if (vp.size.height < minSide) vp = NSInsetRect(vp, 0, (vp.size.height - minSide) / 2);
+	_vp = vp;
+	_dim.hole = vp;
+	_lens.frame = NSInsetRect(vp, -kLensPad, -kLensPad);
+	[self.window invalidateCursorRectsForView:self];
+}
+
+- (NSView *)hitTest:(NSPoint)p { return [super hitTest:p] ? self : nil; }
+- (void)resetCursorRects
+{
+	if (!NSIsEmptyRect(_vp)) [self addCursorRect:_vp cursor:NSCursor.openHandCursor];
+}
+
+- (void)mouseDown:(NSEvent *)e
+{
+	NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+	_grab = NSPointInRect(p, _vp) ? NSMakePoint(p.x - NSMidX(_vp), p.y - NSMidY(_vp)) : NSZeroPoint;
+	[NSCursor.closedHandCursor push];
+	[self moveTo:p];
+}
+- (void)mouseDragged:(NSEvent *)e { [self moveTo:[self convertPoint:e.locationInWindow fromView:nil]]; }
+- (void)mouseUp:(NSEvent *)e { [NSCursor pop]; }
+
+- (void)moveTo:(NSPoint)p
+{
+	NSSize s = self.bounds.size;
+	[self.pageView mapMovedTo:NSMakePoint((p.x - _grab.x) / s.width, (p.y - _grab.y) / s.height)];
+}
+
+- (void)scrollWheel:(NSEvent *)e { [self.target scrollWheel:e]; }
+- (void)magnifyWithEvent:(NSEvent *)e { [self.target magnifyWithEvent:e]; }
+@end
+
+// --- the page view -------------------------------------------------------------
+
+static bool Covers(NSRect outer, NSRect inner) { return NSContainsRect(NSInsetRect(outer, -0.5, -0.5), inner); }
+
+@implementation PageView {
+	PageScrollView *_scroll;
+	DocView *_doc;
+	PageSurface *_surface;
+	ImageLayerView *_detail;
+	MiniMap *_map;
+	CGImageRef _base;   // the fitted page image
+	int _basePage;      // its page, or -1 to re-render
+	int _bw, _bh;       // the pixel box it was fitted into
+	int _shownPage;
+	NSSize _page;       // the page at 100%, in points
+	// The detail on show: page, zoom and box it was rendered for, what it covers, where it lands.
+	bool _dShown;
+	int _dPage, _dw, _dh;
+	CGFloat _dZoom;
+	NSRect _dRegion, _dPlaced;
+	NSSize _dSize, _dPx; // _dPx: its size in pixels
+	// The detail asked for and not yet arrived.
+	bool _pending;
+	int _pPage;
+	NSRect _pRegion;
+	// Zoom and box of the last request: neighbour renders for others are stale.
+	CGFloat _kZoom;
+	int _kw, _kh, _prefetched; // _prefetched: page whose neighbours were queued for this key
+	BOOL _liveMagnify;
+	int _mapPage, _mapAsked;
+	bool _mapIsThumb;
+}
+
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)isOpaque { return YES; }
+
+- (instancetype)initWithFrame:(NSRect)f
+{
+	if (!(self = [super initWithFrame:f])) return nil;
+	[self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
+	_basePage = _shownPage = _mapPage = _mapAsked = _prefetched = -1;
+
+	_scroll = [PageScrollView new];
+	_scroll.contentView = [CenteringClipView new];
+	_scroll.drawsBackground = NO;
+	_scroll.hasVerticalScroller = YES;
+	_scroll.hasHorizontalScroller = YES;
+	_scroll.autohidesScrollers = YES;
+	_scroll.automaticallyAdjustsContentInsets = NO;
+	_scroll.allowsMagnification = YES;
+	_scroll.minMagnification = 1;
+	_scroll.maxMagnification = kZoomMax;
+	_doc = [DocView new];
+	_surface = [PageSurface new];
+	_detail = [ImageLayerView new];
+	_detail.hidden = YES;
+	[_surface addSubview:_detail];
+	[_doc addSubview:_surface];
+	_scroll.documentView = _doc;
+	_scroll.translatesAutoresizingMaskIntoConstraints = NO;
+	[self addSubview:_scroll];
+	// The scroll view fills the window, under the glass toolbar and sidebar; its content insets
+	// keep the page clear of them until it's zoomed and scrolled under.
+	[NSLayoutConstraint activateConstraints:@[
+		[_scroll.topAnchor constraintEqualToAnchor:self.topAnchor],
+		[_scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+		[_scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+		[_scroll.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+	]];
+
+	_map = [MiniMap new];
+	_map.pageView = self;
+	_map.target = _scroll;
+	_map.hidden = YES;
+	[self addSubview:_map];
+
+	NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+	_scroll.contentView.postsBoundsChangedNotifications = YES;
+	[nc addObserver:self selector:@selector(viewChanged:) name:NSViewBoundsDidChangeNotification object:_scroll.contentView];
+	[nc addObserver:self selector:@selector(magnifyStarted:) name:NSScrollViewWillStartLiveMagnifyNotification object:_scroll];
+	[nc addObserver:self selector:@selector(magnifyEnded:) name:NSScrollViewDidEndLiveMagnifyNotification object:_scroll];
+	return self;
+}
+
+- (void)dealloc { CGImageRelease(_base); }
+
+- (void)setViewer:(Viewer *)v
+{
+	_viewer = v;
+	_scroll.viewer = v;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+	[[NSColor textBackgroundColor] setFill];
+	NSRectFill(dirty);
+}
+
+- (void)dropCache
+{
+	_basePage = -1; // the page stays on screen; it's re-rendered when used again
+	[self hideDetail];
+	_pending = false;
+	_prefetched = -1;
+}
+
+- (void)layout
+{
+	[super layout];
+	NSEdgeInsets in = self.safeAreaInsets, cur = _scroll.contentInsets;
+	if (in.top != cur.top || in.left != cur.left || in.bottom != cur.bottom || in.right != cur.right) {
+		_scroll.contentInsets = in;
+		[self scrollTo:_scroll.contentView.bounds.origin];
+	}
+	[self reload];
+}
+
+- (void)viewDidEndLiveResize
+{
+	[super viewDidEndLiveResize];
+	self.needsLayout = YES;
+}
+
+// Lays out the current page, rendering it if the page or the space for it changed.
+- (void)reload
+{
+	Viewer *v = self.viewer;
+	if (!v) return;
+	int n = v->current;
+	NSEdgeInsets in = _scroll.contentInsets;
+	NSSize clip = _scroll.contentSize;
+	clip.width -= in.left + in.right;
+	clip.height -= in.top + in.bottom;
+	NSRect px = [self convertRectToBacking:NSMakeRect(0, 0, clip.width - 2 * kPageMargin, clip.height - 2 * kPageMargin)];
+	int w = (int)floor(px.size.width), h = (int)floor(px.size.height);
+	if (w <= 0 || h <= 0) return;
+
+	// During a live resize the last image is stretched; it's re-rendered when the resize ends.
+	if (!(_base && _basePage == n && ((_bw == w && _bh == h) || self.inLiveResize))) {
+		CGImageRef img = [v copyImageForPage:n width:w height:h];
+		if (!img) return;
+		CGImageRelease(_base);
+		_base = img;
+		_basePage = n;
+		_bw = w;
+		_bh = h;
+		_surface.image = img;
+	}
+
+	// The page in points, pixel-aligned. Only a live resize scales the image up.
+	CGFloat scale = self.window.backingScaleFactor ?: 2;
+	CGFloat iw = CGImageGetWidth(_base), ih = CGImageGetHeight(_base);
+	CGFloat s = fmin(w / iw, h / ih);
+	if (!self.inLiveResize) s = fmin(1, s);
+	NSSize page = NSMakeSize(round(iw * s) / scale, round(ih * s) / scale);
+	if (!NSEqualSizes(page, _page)) {
+		_page = page;
+		_surface.frame = NSMakeRect(kPageMargin, kPageMargin, page.width, page.height);
+		[_doc setFrameSize:NSMakeSize(page.width + 2 * kPageMargin, page.height + 2 * kPageMargin)];
+		[self scrollTo:_scroll.contentView.bounds.origin];
+	}
+
+	if (n != _shownPage) {
+		// A new page opens at its top, centred across, at the same zoom.
+		_shownPage = n;
+		_pending = false;
+		[self hideDetail];
+		[self scrollTo:[self topOrigin]];
+		[self showCachedDetail];
+	}
+	[self placeDetail];
+	[self updateMap];
+	[self updateDetail];
+}
+
+- (void)scrollTo:(NSPoint)origin
+{
+	NSClipView *c = _scroll.contentView;
+	NSRect b = c.bounds;
+	b.origin = origin;
+	[c scrollToPoint:[c constrainBoundsRect:b].origin];
+	[_scroll reflectScrolledClipView:c];
+}
+
+// What's on screen, in page points (y down), not clipped to the page. Includes what shows through
+// the toolbar and sidebar.
+- (NSRect)visiblePage { return NSOffsetRect(_scroll.contentView.bounds, -kPageMargin, -kPageMargin); }
+
+// The part of the clip view's bounds not under the toolbar or sidebar, in document units.
+- (NSRect)unobscured
+{
+	NSRect b = _scroll.contentView.bounds;
+	NSEdgeInsets in = _scroll.contentInsets;
+	CGFloat m = _scroll.magnification;
+	return NSMakeRect(b.origin.x + in.left / m, b.origin.y + in.top / m, b.size.width - (in.left + in.right) / m,
+	                  b.size.height - (in.top + in.bottom) / m);
+}
+
+// Bounds origin that puts the unobscured part at the top of the page, centred across.
+- (NSPoint)topOrigin
+{
+	NSRect u = [self unobscured];
+	NSEdgeInsets in = _scroll.contentInsets;
+	CGFloat m = _scroll.magnification;
+	return NSMakePoint((_doc.frame.size.width - u.size.width) / 2 - in.left / m, -in.top / m);
+}
+
+// --- zoom ---
+
+- (CGFloat)zoom { return _scroll.magnification; }
+
+// Instant, about the middle of the view.
+- (void)setZoom:(CGFloat)z
+{
+	z = fmin(fmax(z, 1), kZoomMax);
+	NSRect u = [self unobscured];
+	[_scroll setMagnification:z centeredAtPoint:NSMakePoint(NSMidX(u), NSMidY(u))];
+}
+
+- (void)viewChanged:(NSNotification *)note
+{
+	[self placeDetail];
+	[self updateMap];
+	[self updateDetail];
+	[self.viewer zoomChanged];
+}
+
+- (void)magnifyStarted:(NSNotification *)note { _liveMagnify = YES; }
+- (void)magnifyEnded:(NSNotification *)note
+{
+	_liveMagnify = NO;
+	[self placeDetail];
+	[self updateDetail];
+}
+
+// --- detail ---
+
+- (void)hideDetail
+{
+	_dShown = false;
+	_detail.hidden = YES;
+	_detail.contents = nil;
+}
+
+- (void)placeDetail
+{
+	if (!_dShown || _dSize.width <= 0 || _dSize.height <= 0) return;
+	CGFloat fx = _page.width / _dSize.width, fy = _page.height / _dSize.height;
+	NSRect f = NSMakeRect(_dPlaced.origin.x * fx, _dPlaced.origin.y * fy, _dPlaced.size.width * fx,
+	                      _dPlaced.size.height * fy);
+	// At its own zoom the render maps 1:1 to screen pixels: snap it onto them so the GPU doesn't
+	// resample it (a shift of under half a pixel).
+	NSWindow *win = self.window;
+	if (win && SameZoom(_dZoom, _scroll.magnification) && !_liveMagnify) {
+		NSRect b = [win convertRectToBacking:[_surface convertRect:f toView:nil]];
+		b.origin.x = round(b.origin.x);
+		b.origin.y = round(b.origin.y);
+		b.size = _dPx;
+		f = [_surface convertRect:[win convertRectFromBacking:b] fromView:nil];
+	}
+	if (!NSEqualRects(f, _detail.frame)) _detail.frame = f;
+}
+
+// Shows the cached detail for the current page if it was rendered for this zoom and box.
+- (void)showCachedDetail
+{
+	Viewer *v = self.viewer;
+	if (!v) return;
+	int n = v->current;
+	CGFloat z = _scroll.magnification;
+	PageDetail d = {};
+	{
+		DocLock lock;
+		auto it = v->detailCache.find(n);
+		if (it == v->detailCache.end() || it->second.w != _bw || it->second.h != _bh || !SameZoom(it->second.zoom, z))
+			return;
+		d = it->second;
+	}
+	_detail.contents = d.surf;
+	_dPx = NSMakeSize(d.pw, d.ph);
+	_dShown = true;
+	_dPage = n;
+	_dZoom = d.zoom;
+	_dw = d.w;
+	_dh = d.h;
+	_dRegion = d.region;
+	_dPlaced = d.placed;
+	_dSize = d.size;
+	_detail.hidden = NO;
+	[self placeDetail];
+}
+
+// Asks for a sharp render of what's in view once zoomed in and settled, unless one covers it.
+- (void)updateDetail
+{
+	Viewer *v = self.viewer;
+	if (!v || !_base || _basePage < 0) return;
+	CGFloat z = _scroll.magnification;
+	if (z <= 1.001) {
+		if (_dShown || _pending || _prefetched >= 0) {
+			[self hideDetail];
+			_pending = false;
+			_prefetched = -1;
+			[v dropDetails];
+		}
+		return;
+	}
+	if (_liveMagnify || self.inLiveResize) return;
+	if (!SameZoom(z, _kZoom) || _kw != _bw || _kh != _bh) {
+		_kZoom = z;
+		_kw = _bw;
+		_kh = _bh;
+		v->detailGen++;
+		_pending = false;
+		_prefetched = -1;
+	}
+	int n = v->current;
+	NSRect vis = NSIntersectionRect([self visiblePage], NSMakeRect(0, 0, _page.width, _page.height));
+	if (NSIsEmptyRect(vis)) return;
+	CGFloat scale = self.window.backingScaleFactor ?: 2;
+	if (_dShown && _dPage == n && SameZoom(_dZoom, z) && _dw == _bw && _dh == _bh && Covers(_dRegion, vis)) {
+		// Sharp: get the neighbouring pages ready too, at the view they open with.
+		if (_prefetched != n) {
+			_prefetched = n;
+			// The view a page opens at, taking the neighbours to be this page's size.
+			NSClipView *c = _scroll.contentView;
+			NSRect t = c.bounds;
+			t.origin = [self topOrigin];
+			t = NSOffsetRect([c constrainBoundsRect:t], -kPageMargin, -kPageMargin);
+			t = NSInsetRect(t, -t.size.width * kDetailMargin, -t.size.height * kDetailMargin);
+			for (int m : {n - 1, n + 1})
+				if (m >= 0 && m < v->count)
+					[v prefetchDetail:m width:_bw height:_bh zoom:z scale:scale region:t];
+		}
+		return;
+	}
+	if (_pending && _pPage == n && Covers(_pRegion, vis)) return;
+	_pending = true;
+	_pPage = n;
+	_pRegion = NSInsetRect(vis, -vis.size.width * kDetailMargin, -vis.size.height * kDetailMargin);
+	[v requestDetail:n width:_bw height:_bh zoom:z scale:scale region:_pRegion];
+}
+
+- (void)detailReady:(int)n
+{
+	Viewer *v = self.viewer;
+	if (!v || n != v->current) return;
+	[self showCachedDetail];
+	NSRect page = NSMakeRect(0, 0, _page.width, _page.height);
+	if (_pending && _dShown && Covers(_dRegion, NSIntersectionRect(_pRegion, page))) _pending = false;
+	[self updateDetail];
+}
+
+// --- mini-map ---
+
+- (void)updateMap
+{
+	Viewer *v = self.viewer;
+	BOOL show = v && _base && _scroll.magnification > 1.001;
+	_map.hidden = !show;
+	if (!show) return;
+	int n = v->current;
+	if (_mapPage != n || !_mapIsThumb) {
+		// The page's sidebar thumbnail; the page image until that's ready.
+		CGImageRef t = [v copyThumbForPage:n request:_mapAsked != n];
+		_mapAsked = n;
+		_mapPage = n;
+		_mapIsThumb = t != NULL;
+		[_map setImage:t ?: _base];
+		CGImageRelease(t);
+	}
+	NSSize ms = [MiniMap sizeForPage:_page];
+	NSRect f = NSMakeRect(NSMaxX(self.bounds) - kMapInset - ms.width, kMapInset, ms.width, ms.height);
+	if (!NSEqualRects(f, _map.frame)) _map.frame = f;
+	NSRect vis = NSOffsetRect([self unobscured], -kPageMargin, -kPageMargin);
+	NSRect unit = NSMakeRect(vis.origin.x / _page.width, vis.origin.y / _page.height, vis.size.width / _page.width,
+	                         vis.size.height / _page.height);
+	[_map setViewport:NSIntersectionRect(unit, NSMakeRect(0, 0, 1, 1))];
+}
+
+- (void)thumbReady:(int)n
+{
+	if (n == _mapPage && !_mapIsThumb) {
+		_mapPage = -1;
+		[self updateMap];
+	}
+}
+
+// Centres the view on a point of the page given in fractions of it.
+- (void)mapMovedTo:(NSPoint)unit
+{
+	NSRect u = [self unobscured];
+	NSPoint o = _scroll.contentView.bounds.origin;
+	CGFloat dx = kPageMargin + unit.x * _page.width - NSMidX(u), dy = kPageMargin + unit.y * _page.height - NSMidY(u);
+	[self scrollTo:NSMakePoint(o.x + dx, o.y + dy)];
+}
+
+// --- pan benchmark (LEANPDF_PANBENCH=1): zooms in, pans for 10 s, reports frame pacing ---
+
+- (void)runPanBench
+{
+	self.zoom = 2.5;
+	if (@available(macOS 14.0, *)) {
+		CADisplayLink *l = [self displayLinkWithTarget:self selector:@selector(benchTick:)];
+		[l addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+	}
+}
+
+- (void)benchTick:(CADisplayLink *)l API_AVAILABLE(macos(14.0))
+{
+	static double last, start, worst, dir = 1, work;
+	static int frames, late, missed;
+	double t = l.timestamp, period = l.targetTimestamp - l.timestamp;
+	if (start == 0) start = t;
+	if (last) {
+		double iv = t - last;
+		frames++;
+		if (iv > period * 1.5) { late++; missed += (int)lround(iv / period) - 1; }
+		worst = fmax(worst, iv);
+	}
+	last = t;
+	double t0 = CACurrentMediaTime();
+	NSRect b = _scroll.contentView.bounds;
+	CGFloat spanX = _doc.frame.size.width - b.size.width, spanY = _doc.frame.size.height - b.size.height;
+	NSPoint o = b.origin;
+	o.y += 6 * dir;
+	if (o.y > spanY || o.y < 0) dir = -dir;
+	o.x = spanX / 2 + sin((t - start) * 1.3) * spanX / 2;
+	[self scrollTo:o];
+	work += CACurrentMediaTime() - t0;
+	if (t - start > 10) {
+		printf("panbench: %.0f Hz, %d frames, %d late (%d missed), worst %.1f ms, main-thread work %.2f ms/frame\n",
+		       1 / period, frames, late, missed, worst * 1000, work * 1000 / frames);
+		fflush(stdout);
+		exit(0);
+	}
+}
+
+// --- input ---
+
+- (void)keyDown:(NSEvent *)e
+{
+	if (!HandlePageKey(self.viewer, e)) [super keyDown:e];
+}
+
+- (void)scrollWheel:(NSEvent *)e { [_scroll scrollWheel:e]; }
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)s { return NSDragOperationCopy; }
 
@@ -1100,7 +2173,10 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 	[split addSplitViewItem:sideItem];
 	self.sideItem = sideItem;
 	[self fitSidebarWidth:NO];
-	[split addSplitViewItem:[NSSplitViewItem splitViewItemWithViewController:mainVC]];
+	NSSplitViewItem *mainItem = [NSSplitViewItem splitViewItemWithViewController:mainVC];
+	// As in Preview: the page runs under the floating glass sidebar when zoomed.
+	if (@available(macOS 26.0, *)) mainItem.automaticallyAdjustsSafeAreaInsets = YES;
+	[split addSplitViewItem:mainItem];
 	split.splitView.autosaveName = @"LeanPDFSplit";
 
 	self.window = [NSWindow windowWithContentViewController:split];
@@ -1128,12 +2204,16 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 	[self.toc reloadData];
 	[self goToPage:0];
 	[self.window makeFirstResponder:self.pageView];
+	if (getenv("LEANPDF_PANBENCH"))
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			[self.pageView performSelector:@selector(runPanBench)];
+		});
 }
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)t
 {
 	return @[ NSToolbarFlexibleSpaceItemIdentifier, @"sidebar",
-	          NSToolbarSidebarTrackingSeparatorItemIdentifier ];
+	          NSToolbarSidebarTrackingSeparatorItemIdentifier, NSToolbarFlexibleSpaceItemIdentifier, @"zoom" ];
 }
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)t
@@ -1143,6 +2223,25 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)t itemForItemIdentifier:(NSToolbarItemIdentifier)i willBeInsertedIntoToolbar:(BOOL)f
 {
+	if ([i isEqualToString:@"zoom"]) {
+		NSArray *images = @[
+			[NSImage imageWithSystemSymbolName:@"minus.magnifyingglass" accessibilityDescription:@"Zoom Out"],
+			[NSImage imageWithSystemSymbolName:@"plus.magnifyingglass" accessibilityDescription:@"Zoom In"],
+		];
+		NSToolbarItemGroup *g = [NSToolbarItemGroup groupWithItemIdentifier:i images:images
+		                                                       selectionMode:NSToolbarItemGroupSelectionModeMomentary
+		                                                              labels:@[ @"Zoom Out", @"Zoom In" ]
+		                                                              target:self action:@selector(zoomGroup:)];
+		g.label = @"Zoom";
+		g.autovalidates = NO;
+		for (NSToolbarItem *s in g.subitems) {
+			s.autovalidates = NO;
+			s.toolTip = s.label;
+		}
+		self.zoomItem = g;
+		[self zoomChanged];
+		return g;
+	}
 	if (![i isEqualToString:@"sidebar"]) return nil;
 	// Like Preview: one button whose menu hides the sidebar or picks what it shows.
 	NSMenu *m = [NSMenu new];
@@ -1163,6 +2262,38 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 
 - (void)toggleSidebarFromMenu:(id)sender { self.sideItem.animator.collapsed = !self.sideItem.collapsed; }
 
+// --- zoom --------------------------------------------------------------------
+// Steps through kZoomLevels, instantly. Pinching is the scroll view's own.
+
+- (void)stepZoom:(int)dir
+{
+	CGFloat z = self.pageView.zoom, next = z;
+	int levels = sizeof kZoomLevels / sizeof *kZoomLevels;
+	if (dir > 0) {
+		for (int i = 0; i < levels; i++)
+			if (kZoomLevels[i] > z + 1e-3) { next = kZoomLevels[i]; break; }
+	} else {
+		for (int i = levels - 1; i >= 0; i--)
+			if (kZoomLevels[i] < z - 1e-3) { next = kZoomLevels[i]; break; }
+	}
+	self.pageView.zoom = next;
+}
+
+- (IBAction)zoomIn:(id)s { [self stepZoom:1]; }
+- (IBAction)zoomOut:(id)s { [self stepZoom:-1]; }
+- (IBAction)resetZoom:(id)s { self.pageView.zoom = 1; }
+- (void)zoomGroup:(NSToolbarItemGroup *)g { [self stepZoom:g.selectedIndex == 0 ? -1 : 1]; }
+
+- (void)zoomChanged
+{
+	CGFloat z = self.pageView.zoom;
+	NSArray<NSToolbarItem *> *subs = self.zoomItem.subitems;
+	if (subs.count != 2) return;
+	BOOL canOut = z > 1.001, canIn = z < kZoomMax - 1e-3;
+	if (subs[0].enabled != canOut) subs[0].enabled = canOut;
+	if (subs[1].enabled != canIn) subs[1].enabled = canIn;
+}
+
 // --- navigation ------------------------------------------------------------
 
 // Any plain navigation ends a Shift range, so the next one starts from the page being viewed.
@@ -1179,7 +2310,7 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 	int old = current;
 	current = n;
 	[self updateSubtitle];
-	self.pageView.needsDisplay = YES;
+	[self.pageView reload];
 	for (int r : {old, n})
 		[self markCurrent:[self.thumbs viewAtColumn:0 row:r makeIfNecessary:NO] row:r];
 	[self.thumbs scrollRowToVisible:n];
@@ -1350,6 +2481,10 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 			if (abs(e->first - n) > 1) { CGImageRelease(e->second.img); e = pageCache.erase(e); }
 			else ++e;
 		}
+		for (auto e = detailCache.begin(); e != detailCache.end();) {
+			if (abs(e->first - n) > 1) e = detailCache.erase(e);
+			else ++e;
+		}
 	}
 	// Stack is LIFO: queue previous first so the next page is rendered first.
 	if (n > 0) Enqueue(self, n - 1, kJobPrefetch, w, h);
@@ -1357,10 +2492,90 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 	return img;
 }
 
+- (void)requestDetail:(int)n width:(int)w height:(int)h zoom:(CGFloat)z scale:(CGFloat)s region:(NSRect)r
+{
+	Job *j = NewJob(self, n, kJobDetail, w, h);
+	j->zoom = z;
+	j->scale = s;
+	j->region = r;
+	j->gen = ++detailReq;
+	j->space = (__bridge id)self.window.colorSpace.CGColorSpace;
+	Push(j);
+}
+
+- (void)prefetchDetail:(int)n width:(int)w height:(int)h zoom:(CGFloat)z scale:(CGFloat)s region:(NSRect)r
+{
+	Job *j = NewJob(self, n, kJobDetail, w, h);
+	j->zoom = z;
+	j->scale = s;
+	j->top = true;
+	j->region = r;
+	j->gen = detailGen;
+	j->space = (__bridge id)self.window.colorSpace.CGColorSpace;
+	Push(j);
+}
+
+- (void)dropDetails
+{
+	DocLock lock;
+	detailCache.clear();
+}
+
+// The sidebar thumbnail of page n, from memory or disk. If there's none and request is set, one is
+// rendered and the page view hears of it through thumbReady:. Returns +1 or NULL.
+- (CGImageRef)copyThumbForPage:(int)n request:(BOOL)request
+{
+	NSImage *img = [self.thumbCache objectForKey:@(n)];
+	if (img) return CGImageRetain([img CGImageForProposedRect:NULL context:nil hints:nil]);
+	CGFloat s = self.window.backingScaleFactor ?: 2;
+	CGImageRef c = self.thumbDir ? LoadThumbFile([self thumbFile:n scale:s]) : NULL;
+	if (c) {
+		[self.thumbCache setObject:ThumbImage(c, s) forKey:@(n) cost:CGImageGetBytesPerRow(c) * CGImageGetHeight(c)];
+		return c;
+	}
+	if (request) {
+		[self.thumbPending addIndex:n];
+		Job *j = NewJob(self, n, kJobThumb, (int)(kThumbW * s), (int)(kThumbH * s));
+		j->force = true;
+		Push(j);
+	}
+	return NULL;
+}
+
 // Called on the worker thread.
 - (void)runJob:(Job *)j
 {
 	int n = j->page;
+	if (j->kind == kJobDetail) {
+		NSRect region = j->region, placed;
+		NSSize size;
+		CGImageRef img;
+		auto fresh = [&] {
+			if (!doc || dormant || abs(n - current) > 1) return false;
+			if (j->gen != (j->top ? detailGen : detailReq)) return false;
+			auto it = detailCache.find(n);
+			return !(j->top && it != detailCache.end() && it->second.w == j->w && it->second.h == j->h &&
+			         SameZoom(it->second.zoom, j->zoom));
+		};
+		{
+			DocLock lock;
+			if (!fresh()) return;
+			img = RenderDetail(g_worker_ctx, doc, n, j->w, j->h, j->zoom, j->scale, false, NSZeroSize, &region, &placed, &size);
+		}
+		if (!img) return;
+		// Outside the lock, so page flips needn't wait for it.
+		id surf = (__bridge_transfer id)SurfaceFromImage(img, (__bridge CGColorSpaceRef)j->space);
+		int pw = (int)CGImageGetWidth(img), ph = (int)CGImageGetHeight(img);
+		CGImageRelease(img);
+		if (!surf) return;
+		{
+			DocLock lock;
+			if (!fresh()) return;
+			detailCache[n] = {j->w, j->h, j->zoom, region, placed, size, surf, pw, ph};
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{ [self.pageView detailReady:n]; });
+		return;
+	}
 	if (j->kind == kJobPrefetch) {
 		DocLock lock;
 		if (!doc || dormant || abs(n - current) > 1) return;
@@ -1374,7 +2589,7 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 	}
 
 	CGImageRef img = NULL;
-	if (n >= visLo && n <= visHi) {
+	if (j->force || (n >= visLo && n <= visHi)) {
 		DocLock lock;
 		if (doc) img = RenderPage(g_worker_ctx, doc, n, j->w, j->h);
 	}
@@ -1389,6 +2604,7 @@ static NSArray<NSString *> *LoadPageLabels(pdf_document *pdf, int count)
 		[self.thumbCache setObject:thumb forKey:@(n) cost:cost];
 		ThumbCell *cell = [self.thumbs viewAtColumn:0 row:n makeIfNecessary:NO];
 		cell.thumb.image = thumb;
+		[self.pageView thumbReady:n];
 	});
 }
 
@@ -1430,6 +2646,7 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 	}
 	label.alignment = NSTextAlignmentCenter;
 	label.font = [NSFont systemFontOfSize:NSFont.systemFontSize weight:NSFontWeightMedium];
+	[(ThumbCell *)cell restyle]; // fixed label colour from the start
 	ThumbView *tv = [ThumbView new];
 	tv.translatesAutoresizingMaskIntoConstraints = NO;
 	[cell addSubview:tv];
@@ -1779,6 +2996,8 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 	if (item.action == @selector(exportSelection:) || item.action == @selector(printDocument:) || item.action == @selector(copy:))
 		return pdf != NULL;
 	if (item.action == @selector(copyOCRText:)) return pdf != NULL && !self.ocrJob;
+	if (item.action == @selector(zoomIn:)) return self.pageView.zoom < kZoomMax - 1e-3;
+	if (item.action == @selector(zoomOut:) || item.action == @selector(resetZoom:)) return self.pageView.zoom > 1.001;
 	if (item.action == @selector(nextPage:) || item.action == @selector(lastPage:)) return current + 1 < count;
 	if (item.action == @selector(previousPage:) || item.action == @selector(firstPage:)) return current > 0;
 	return YES;
@@ -1790,7 +3009,7 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 {
 	BOOL wasDormant = dormant;
 	[self touch];
-	if (wasDormant) self.pageView.needsDisplay = YES; // re-render the page and prefetch its neighbours
+	if (wasDormant) [self.pageView reload]; // re-render the page and prefetch its neighbours
 }
 
 - (void)windowDidResignKey:(NSNotification *)note { [self startIdleTimer]; }
@@ -1827,7 +3046,7 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 	dormant = true;
 	@synchronized(g_jobs) {
 		NSIndexSet *mine = [g_jobs indexesOfObjectsPassingTest:^BOOL(Job *j, NSUInteger, BOOL *) {
-			return j->viewer == self && j->kind == kJobPrefetch;
+			return j->viewer == self && j->kind != kJobThumb;
 		}];
 		[g_jobs removeObjectsAtIndexes:mine];
 	}
@@ -1836,6 +3055,7 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 		for (auto &e : pageCache) CGImageRelease(e.second.img);
 		pageCache.clear();
 	}
+	[self dropDetails];
 	[self.pageView dropCache];
 	[self.thumbCache removeAllObjects];
 	ReleaseMemory();
@@ -1853,6 +3073,7 @@ static NSTableCellView *MakeCell(NSTableView *t, NSString *ident, BOOL withImage
 		DocLock lock;
 		for (auto &e : pageCache) CGImageRelease(e.second.img);
 		pageCache.clear();
+		detailCache.clear();
 		fz_drop_document(g_ctx, doc);
 		doc = NULL;
 		pdf = NULL;
@@ -2056,6 +3277,13 @@ static void BuildMenus()
 	Item(edit, @"Select All", @selector(selectAll:), @"a");
 
 	NSMenu *view = Submenu(bar, @"View");
+	Item(view, @"Zoom In", @selector(zoomIn:), @"+");
+	NSMenuItem *zoomIn = Item(view, @"Zoom In", @selector(zoomIn:), @"="); // ⌘= without Shift
+	zoomIn.hidden = YES;
+	zoomIn.allowsKeyEquivalentWhenHidden = YES;
+	Item(view, @"Zoom Out", @selector(zoomOut:), @"-");
+	Item(view, @"Reset Zoom", @selector(resetZoom:), @"0");
+	[view addItem:NSMenuItem.separatorItem];
 	Item(view, @"Toggle Sidebar", @selector(toggleSidebar:), @"s", NSEventModifierFlagCommand | NSEventModifierFlagOption);
 	Item(view, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", NSEventModifierFlagCommand | NSEventModifierFlagControl);
 
